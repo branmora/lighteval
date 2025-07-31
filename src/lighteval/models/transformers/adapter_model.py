@@ -74,8 +74,7 @@ class AdapterModel(TransformersModel):
         model_parallel, max_memory, device_map = self.init_model_parallel(self.config.model_parallel)
         self.config.model_parallel = model_parallel
 
-        adapter_weights = self.config.pretrained
-        merged_path = f"{adapter_weights}-adapter-applied"
+        adapter_weights_path = self.config.model_name
 
         if self.config.dtype == "4bit":
             from transformers import BitsAndBytesConfig
@@ -88,40 +87,25 @@ class AdapterModel(TransformersModel):
         else:
             quantization_config = None
 
-        if self.accelerator.is_local_main_process if self.accelerator is not None else nullcontext():
-            logger.info(f"Loading model from {adapter_weights} and applying adapter to {self.config.base_model}")
-            base = AutoModelForCausalLM.from_pretrained(
-                self.config.base_model, torch_dtype=torch.float16, low_cpu_mem_usage=True
-            )
-            # resize model for adapters with added tokens
-            token_diff = len(self._tokenizer) - base.config.vocab_size
-            if token_diff != 0:
-                if token_diff > 0:
-                    logger.info(
-                        f"You're using the adapter model's tokenizer, which has more tokens than the base model. Adding {token_diff} token(s)."
-                    )
-                else:
-                    logger.info(
-                        f"You're using the adapter model's tokenizer, which has fewer tokens than the base model. Removing {abs(token_diff)} token(s)."
-                    )
-                base.resize_token_embeddings(len(self._tokenizer))
-            # Should pass revision
-            model = PeftModel.from_pretrained(base, adapter_weights)
-            model = model.merge_and_unload()
-
-            logger.info("Saving model with adapter applied")
-            base.save_pretrained(merged_path)
-
-        logger.info(f"Loading model from {merged_path}")
-
-        model = AutoModelForCausalLM.from_pretrained(
-            merged_path,
+        logger.info(f"Loading base model: {self.config.base_model}")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            self.config.base_model,
             max_memory=max_memory,
             device_map=device_map,
             torch_dtype=torch_dtype,
             trust_remote_code=self.config.trust_remote_code,
             quantization_config=quantization_config,
         )
+
+        logger.info(f"Applying adapter: {adapter_weights_path}")
+        model = PeftModel.from_pretrained(base_model, adapter_weights_path, torch_dtype=torch_dtype)
+
+        if not model.peft_config[model.active_adapter].is_prompt_learning:
+            logger.info("Adapter is mergeable, merging in memory...")
+            model = model.merge_and_unload()
+        else:
+            logger.info("Adapter is not mergeable (e.g., Prefix-Tuning), using unmerged PeftModel.")
+
 
         return model
 
